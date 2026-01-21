@@ -4,12 +4,13 @@ from models import Course, Room, TimeSlot, Timetable
 
 app = create_app()
 
+
 def generate_timetable():
     with app.app_context():
 
         print("🔄 Starting timetable optimization...")
 
-        # Clear existing timetable
+        # 1️⃣ Clear old timetable
         Timetable.query.delete()
         db.session.commit()
 
@@ -17,35 +18,52 @@ def generate_timetable():
         rooms = Room.query.all()
         slots = TimeSlot.query.all()
 
-        print(f"Courses: {len(courses)}")
-        print(f"Rooms: {len(rooms)}")
-        print(f"TimeSlots: {len(slots)}")
+        # 2️⃣ Group slots by day
+        slots_by_day = {}
+        for slot in slots:
+            slots_by_day.setdefault(slot.day, []).append(slot)
+
+        # 3️⃣ Sort slots by start time (important)
+        for day in slots_by_day:
+            slots_by_day[day].sort(key=lambda s: s.start_time)
 
         used_room_slot = set()
         used_faculty_slot = set()
 
         total_assigned = 0
 
+        # 🔁 SLOT ROTATION INDEX (THIS IS THE KEY FIX)
+        slot_rotation_index = 0
+
+        days = list(slots_by_day.keys())
+
         for course in courses:
-            print(f"\nTrying to assign course: {course.course_name}")
+            required_hours = course.weekly_hours
+            assigned_hours = 0
 
-            assigned = False
+            print(f"\n📘 Scheduling {course.course_name} ({required_hours} hrs/week)")
 
-            for slot in slots:
+            day_index = 0
+
+            # 4️⃣ Assign ONE class per day (spread across week)
+            while assigned_hours < required_hours and day_index < len(days):
+                day = days[day_index]
+                day_slots = slots_by_day[day]
+
+                # 🎯 Pick slot using rotation (instead of always first slot)
+                slot = day_slots[slot_rotation_index % len(day_slots)]
+
                 for room in rooms:
 
-                    # Constraint 1: room capacity
-                    if room.capacity < 30:
-                        continue
-
-                    # Constraint 2: room-time clash
+                    # ❌ Room already used at this time
                     if (room.id, slot.id) in used_room_slot:
                         continue
 
-                    # Constraint 3: faculty-time clash
+                    # ❌ Faculty already teaching at this time
                     if (course.faculty_id, slot.id) in used_faculty_slot:
                         continue
 
+                    # ✅ Assign class
                     entry = Timetable(
                         course_id=course.id,
                         faculty_id=course.faculty_id,
@@ -59,19 +77,24 @@ def generate_timetable():
                     used_room_slot.add((room.id, slot.id))
                     used_faculty_slot.add((course.faculty_id, slot.id))
 
-                    print(f"✅ Assigned {course.course_name} → {room.room_name} @ {slot.day} {slot.start_time}")
-
+                    assigned_hours += 1
                     total_assigned += 1
-                    assigned = True
+
+                    print(
+                        f"✅ {course.course_name} → {room.room_name} "
+                        f"@ {day} {slot.start_time}"
+                    )
+
+                    # 🔁 Move to next time slot for next assignment
+                    slot_rotation_index += 1
                     break
 
-                if assigned:
-                    break
+                day_index += 1
 
-            if not assigned:
-                print(f"⚠️ Could not assign course: {course.course_name}")
+            if assigned_hours < required_hours:
+                print(f"⚠️ Only {assigned_hours}/{required_hours} hours assigned")
 
-        print(f"\n🎉 Optimization finished. Total entries created: {total_assigned}")
+        print(f"\n🎉 Optimization complete. Total classes scheduled: {total_assigned}")
 
 
 if __name__ == "__main__":
