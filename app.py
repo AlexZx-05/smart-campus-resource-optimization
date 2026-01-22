@@ -25,7 +25,8 @@ def create_app():
             Room,
             TimeSlot,
             Timetable,
-            FacultyAvailability
+            FacultyAvailability,
+            FacultyPreference
         )
         db.create_all()
 
@@ -38,10 +39,7 @@ def create_app():
 
     @app.route("/api/health")
     def health():
-        return jsonify({
-            "status": "OK",
-            "message": "Backend is healthy"
-        })
+        return jsonify({"status": "OK", "message": "Backend is healthy"})
 
     # -----------------------------
     # MASTER DATA APIs
@@ -112,7 +110,7 @@ def create_app():
         ])
 
     # -----------------------------
-    # 🔥 VISUAL TIMELINE (FREE + OCCUPIED)
+    # VISUAL TIMELINE
     # -----------------------------
     @app.route("/api/timeline")
     def get_timeline():
@@ -137,70 +135,24 @@ def create_app():
             for room in rooms:
                 timeline[day].setdefault(room.room_name, [])
                 key = (room.id, slot.id)
-                time_range = f"{slot.start_time}-{slot.end_time}"
 
                 if key in occupied:
                     timeline[day][room.room_name].append({
-                        "time": time_range,
+                        "time": f"{slot.start_time}-{slot.end_time}",
                         "status": "OCCUPIED",
                         "course": occupied[key]["course"],
                         "faculty": occupied[key]["faculty"]
                     })
                 else:
                     timeline[day][room.room_name].append({
-                        "time": time_range,
+                        "time": f"{slot.start_time}-{slot.end_time}",
                         "status": "FREE"
                     })
 
         return jsonify(timeline)
 
     # -----------------------------
-    # METRICS
-    # -----------------------------
-    @app.route("/api/metrics")
-    def get_metrics():
-        from models import Course, Room, TimeSlot, Timetable
-
-        total_courses = Course.query.count()
-        scheduled = Timetable.query.count()
-        rooms = Room.query.count()
-        slots = TimeSlot.query.count()
-
-        utilization = (
-            (scheduled / (rooms * slots)) * 100
-            if rooms and slots else 0
-        )
-
-        return jsonify({
-            "total_courses": total_courses,
-            "scheduled_classes": scheduled,
-            "room_utilization_percent": round(utilization, 2),
-            "room_conflicts": 0,
-            "faculty_conflicts": 0
-        })
-
-    # -----------------------------
-    # FACULTY ABSENCE LIST
-    # -----------------------------
-    @app.route("/api/faculty/unavailable")
-    def get_unavailable_faculty():
-        from models import FacultyAvailability, Faculty
-
-        records = FacultyAvailability.query.filter_by(available=False).all()
-        result = []
-
-        for r in records:
-            faculty = db.session.get(Faculty, r.faculty_id)
-            result.append({
-                "faculty": faculty.name,
-                "date": r.date.isoformat(),
-                "status": "Absent"
-            })
-
-        return jsonify(result)
-
-    # -----------------------------
-    # ⭐ BEST FREE SLOT SUGGESTION
+    # BEST FREE SLOT SUGGESTION
     # -----------------------------
     @app.route("/api/suggest-slot/<int:faculty_id>")
     def suggest_slot(faculty_id):
@@ -208,42 +160,120 @@ def create_app():
         return jsonify(suggest_best_free_slot(faculty_id))
 
     # -----------------------------
-    # MARK ABSENCE + AUTO REOPTIMIZE
+    # FACULTY PREFERENCE API
     # -----------------------------
-    @app.route("/api/faculty/<int:faculty_id>/unavailable-range", methods=["POST"])
-    def mark_faculty_unavailable_range(faculty_id):
-        from models import FacultyAvailability
-        from optimizer import generate_timetable
+    @app.route("/api/faculty/<int:faculty_id>/preference", methods=["POST"])
+    def set_faculty_preference(faculty_id):
+        from models import FacultyPreference, Faculty
+
+        faculty = db.session.get(Faculty, faculty_id)
+        if not faculty:
+            return jsonify({"error": "Faculty not found"}), 404
 
         data = request.json
-        start = datetime.strptime(data["start_date"], "%Y-%m-%d").date()
-        end = datetime.strptime(data["end_date"], "%Y-%m-%d").date()
 
-        current = start
-        created = 0
+        pref = FacultyPreference.query.filter_by(
+            faculty_id=faculty_id
+        ).first()
 
-        while current <= end:
-            exists = FacultyAvailability.query.filter_by(
-                faculty_id=faculty_id,
-                date=current
-            ).first()
+        if not pref:
+            pref = FacultyPreference(faculty_id=faculty_id)
 
-            if not exists:
-                db.session.add(FacultyAvailability(
-                    faculty_id=faculty_id,
-                    date=current,
-                    available=False
-                ))
-                created += 1
+        pref.blocked_days = ",".join(data.get("blocked_days", []))
+        pref.preferred_start_time = data.get("preferred_start_time")
+        pref.preferred_end_time = data.get("preferred_end_time")
 
-            current += timedelta(days=1)
-
+        db.session.add(pref)
         db.session.commit()
-        generate_timetable()
 
         return jsonify({
-            "message": "Faculty absence recorded & timetable re-optimized",
-            "days_blocked": created
+            "message": "Faculty preference saved successfully",
+            "faculty": faculty.name
+        })
+
+    # -----------------------------
+    # ❓ CONFLICT EXPLANATION API
+    # -----------------------------
+    @app.route("/api/why-not")
+    def explain_why_not():
+        from services.conflict_explainer import explain_conflict
+
+        faculty_id = request.args.get("faculty_id", type=int)
+        day = request.args.get("day")
+        time_range = request.args.get("time")
+        room = request.args.get("room")
+
+        if not all([faculty_id, day, time_range, room]):
+            return jsonify({"error": "Missing query parameters"}), 400
+
+        reasons = explain_conflict(
+            faculty_id=faculty_id,
+            day=day,
+            time_range=time_range,
+            room_name=room
+        )
+
+        return jsonify({
+            "faculty_id": faculty_id,
+            "day": day,
+            "time": time_range,
+            "room": room,
+            "reasons": reasons
+        })
+
+    # -----------------------------
+    # ⭐ AUTO BOOK SLOT API
+    # -----------------------------
+    @app.route("/api/book-slot", methods=["POST"])
+    def book_slot():
+        from models import Timetable, TimeSlot, Room
+
+        data = request.json
+
+        faculty_id = data.get("faculty_id")
+        course_id = data.get("course_id")
+        day = data.get("day")
+        time_range = data.get("time")
+        room_name = data.get("room")
+
+        if not all([faculty_id, course_id, day, time_range, room_name]):
+            return jsonify({"error": "Missing required fields"}), 400
+
+        start_time, end_time = time_range.split("-")
+        slot = TimeSlot.query.filter_by(
+            day=day,
+            start_time=start_time,
+            end_time=end_time
+        ).first()
+
+        if not slot:
+            return jsonify({"error": "Invalid day or time slot"}), 400
+
+        room = Room.query.filter_by(room_name=room_name).first()
+        if not room:
+            return jsonify({"error": "Room not found"}), 404
+
+        if Timetable.query.filter_by(room_id=room.id, timeslot_id=slot.id).first():
+            return jsonify({"error": "Slot already booked for this room"}), 409
+
+        if Timetable.query.filter_by(faculty_id=faculty_id, timeslot_id=slot.id).first():
+            return jsonify({"error": "Faculty already has a class at this time"}), 409
+
+        entry = Timetable(
+            course_id=course_id,
+            faculty_id=faculty_id,
+            room_id=room.id,
+            timeslot_id=slot.id
+        )
+
+        db.session.add(entry)
+        db.session.commit()
+
+        return jsonify({
+            "message": "Class booked successfully",
+            "day": day,
+            "time": time_range,
+            "room": room_name
         })
 
     # -----------------------------
@@ -253,9 +283,7 @@ def create_app():
     def run_optimizer():
         from optimizer import generate_timetable
         generate_timetable()
-        return jsonify({
-            "message": "Timetable optimized successfully"
-        })
+        return jsonify({"message": "Timetable optimized successfully"})
 
     return app
 
