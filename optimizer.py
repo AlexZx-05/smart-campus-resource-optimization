@@ -1,14 +1,34 @@
-from app import create_app
 from extensions import db
-from models import Course, Room, TimeSlot, Timetable
+from models import (
+    Course,
+    Room,
+    TimeSlot,
+    Timetable,
+    FacultyPreference,
+    FacultyAvailability
+)
+from flask import current_app
 
-app = create_app()
+
+DAY_SCORE = {
+    "Monday": 2,
+    "Tuesday": 1,
+    "Wednesday": 1,
+    "Thursday": 0,
+    "Friday": -100  # HARD BLOCK
+}
+
+TIME_SCORE = {
+    "09:00": -2,
+    "10:00": 1,
+    "11:00": 3
+}
 
 
 def generate_timetable():
-    with app.app_context():
+    with current_app.app_context():
 
-        print("🔄 Starting timetable optimization...")
+        print("🔄 Starting preference-aware optimization...")
 
         # 1️⃣ Clear old timetable
         Timetable.query.delete()
@@ -23,7 +43,6 @@ def generate_timetable():
         for slot in slots:
             slots_by_day.setdefault(slot.day, []).append(slot)
 
-        # 3️⃣ Sort slots by start time (important)
         for day in slots_by_day:
             slots_by_day[day].sort(key=lambda s: s.start_time)
 
@@ -31,71 +50,80 @@ def generate_timetable():
         used_faculty_slot = set()
 
         total_assigned = 0
-
-        # 🔁 SLOT ROTATION INDEX (THIS IS THE KEY FIX)
-        slot_rotation_index = 0
-
         days = list(slots_by_day.keys())
 
         for course in courses:
-            required_hours = course.weekly_hours
-            assigned_hours = 0
+            required = course.weekly_hours
+            assigned = 0
+            faculty_id = course.faculty_id
 
-            print(f"\n📘 Scheduling {course.course_name} ({required_hours} hrs/week)")
+            pref = FacultyPreference.query.filter_by(
+                faculty_id=faculty_id
+            ).first()
 
-            day_index = 0
+            blocked_days = pref.blocked_days.split(",") if pref and pref.blocked_days else []
+            pref_start = pref.preferred_start_time if pref else None
+            pref_end = pref.preferred_end_time if pref else None
 
-            # 4️⃣ Assign ONE class per day (spread across week)
-            while assigned_hours < required_hours and day_index < len(days):
-                day = days[day_index]
-                day_slots = slots_by_day[day]
+            print(f"\n📘 Scheduling {course.course_name}")
 
-                # 🎯 Pick slot using rotation (instead of always first slot)
-                slot = day_slots[slot_rotation_index % len(day_slots)]
+            ranked_options = []
 
-                for room in rooms:
+            for day in days:
 
-                    # ❌ Room already used at this time
-                    if (room.id, slot.id) in used_room_slot:
+                if day in blocked_days:
+                    continue
+
+                for slot in slots_by_day[day]:
+
+                    if (faculty_id, slot.id) in used_faculty_slot:
                         continue
 
-                    # ❌ Faculty already teaching at this time
-                    if (course.faculty_id, slot.id) in used_faculty_slot:
-                        continue
+                    for room in rooms:
 
-                    # ✅ Assign class
-                    entry = Timetable(
-                        course_id=course.id,
-                        faculty_id=course.faculty_id,
-                        room_id=room.id,
-                        timeslot_id=slot.id
-                    )
+                        if (room.id, slot.id) in used_room_slot:
+                            continue
 
-                    db.session.add(entry)
-                    db.session.commit()
+                        score = DAY_SCORE.get(day, 0)
+                        score += TIME_SCORE.get(slot.start_time, 0)
 
-                    used_room_slot.add((room.id, slot.id))
-                    used_faculty_slot.add((course.faculty_id, slot.id))
+                        if pref_start and pref_end:
+                            if pref_start <= slot.start_time <= pref_end:
+                                score += 3
 
-                    assigned_hours += 1
-                    total_assigned += 1
+                        ranked_options.append((score, day, slot, room))
 
-                    print(
-                        f"✅ {course.course_name} → {room.room_name} "
-                        f"@ {day} {slot.start_time}"
-                    )
+            ranked_options.sort(reverse=True, key=lambda x: x[0])
 
-                    # 🔁 Move to next time slot for next assignment
-                    slot_rotation_index += 1
+            for score, day, slot, room in ranked_options:
+                if assigned >= required:
                     break
 
-                day_index += 1
+                entry = Timetable(
+                    course_id=course.id,
+                    faculty_id=faculty_id,
+                    room_id=room.id,
+                    timeslot_id=slot.id,
+                    batch=course.department 
+                  
+                )
 
-            if assigned_hours < required_hours:
-                print(f"⚠️ Only {assigned_hours}/{required_hours} hours assigned")
+                db.session.add(entry)
+                db.session.commit()
 
-        print(f"\n🎉 Optimization complete. Total classes scheduled: {total_assigned}")
+                used_room_slot.add((room.id, slot.id))
+                used_faculty_slot.add((faculty_id, slot.id))
 
+                assigned += 1
+                total_assigned += 1
 
-if __name__ == "__main__":
-    generate_timetable()
+                print(
+                    f"✅ {course.course_name} → {day} "
+                    f"{slot.start_time}-{slot.end_time} | "
+                    f"{room.room_name} | score={score}"
+                )
+
+            if assigned < required:
+                print(f"⚠️ Only {assigned}/{required} assigned")
+
+        print(f"\n🎉 Optimization complete: {total_assigned} classes")
